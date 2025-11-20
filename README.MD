@@ -61,7 +61,7 @@ Task execution view allows to see interactions of agent with the Benchmark in mo
 
 # Available Agents
 
-- sgr-agent-store - A simple agent implementation for the store benchmark
+- sgr-agent-store - A simple agent implementation for the store benchmark. It relies on [Schema-Guided Reasoning](https://abdullin.com/schema-guided-reasoning/) to provide adaptive thinking capabilities with a single recursive prompt and gpt-4o.
 
 # Resources
 
