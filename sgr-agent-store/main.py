@@ -1,3 +1,7 @@
+# pip install python-dotenv
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
 import textwrap
 from openai import OpenAI
 from store_agent import run_agent
@@ -5,7 +9,7 @@ from erc3 import ERC3
 
 client = OpenAI()
 core = ERC3()
-MODEL_ID = "gpt-4o"
+MODEL_ID = "gpt-5.1"
 
 # Start session with metadata
 res = core.start_session(
@@ -17,9 +21,9 @@ res = core.start_session(
 status = core.session_status(res.session_id)
 print(f"Session has {len(status.tasks)} tasks")
 
-for task in status.tasks:
+for i, task in enumerate(status.tasks):
     print("="*40)
-    print(f"Starting Task: {task.task_id} ({task.spec_id}): {task.task_text}")
+    print(f"Starting Task #{i}: {task.task_id} ({task.spec_id}): {task.task_text}")
     # start the task
     core.start_task(task)
     try:

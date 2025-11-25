@@ -1,116 +1,263 @@
 import time
-from typing import Annotated, List, Union, Literal
-from annotated_types import MaxLen, MinLen
+import json
+from typing import Annotated, List, Union, Literal, Optional
 from pydantic import BaseModel, Field
 from erc3 import store, ApiException, TaskInfo, ERC3
-from openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage
 
-client = OpenAI()
+def fetch_all_products(store_api):
+    all_products = []
+    offset = 0
+    limit = 3 # Limit set to 3 to comply with potential server restrictions
+    while True:
+        req = store.Req_ListProducts(offset=offset, limit=limit)
+        try:
+            res = store_api.dispatch(req)
+            if hasattr(res, 'products') and res.products:
+                all_products.extend([p.model_dump(exclude_none=True) for p in res.products])
+            
+            if res.next_offset == -1:
+                break
+            offset = res.next_offset
+        except ApiException as e:
+            print(f"Warning: Error fetching products batch: {e}")
+            break
+    return all_products
 
-class ReportTaskCompletion(BaseModel):
-    tool: Literal["report_completion"]
-    completed_steps_laconic: List[str]
-    code: Literal["completed", "failed"]
+def get_tools(store_api):
+    """Create tools bound to the specific store_api instance."""
+    
+    # list_products tool removed as products are now pre-fetched
+    
+    @tool
+    def view_basket():
+        """View current shopping basket.
+        Returns items in basket, subtotal, discount, and total price."""
+        req = store.Req_ViewBasket()
+        try:
+            res = store_api.dispatch(req)
+            return res.model_dump(exclude_none=True)
+        except ApiException as e:
+            return f"Error: {e.detail}"
 
-class NextStep(BaseModel):
-    current_state: str
-    # we'll use only the first step, discarding all the rest.
-    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(5)] =  Field(..., description="explain your thoughts on how to accomplish - what steps to execute")
-    # now let's continue the cascade and check with LLM if the task is done
-    task_completed: bool
-    # Routing to one of the tools to execute the first remaining step
-    # if task is completed, model will pick ReportTaskCompletion
-    function: Union[
-        ReportTaskCompletion,
-        store.Req_ListProducts,
-        store.Req_ViewBasket,
-        store.Req_ApplyCoupon,
-        store.Req_RemoveCoupon,
-        store.Req_AddProductToBasket,
-        store.Req_RemoveItemFromBasket,
-        store.Req_CheckoutBasket,
-    ] = Field(..., description="execute first remaining step")
+    @tool
+    def add_product(sku: str, quantity: int = 1):
+        """Add a product to the shopping basket by SKU.
+        Returns the updated basket status."""
+        req = store.Req_AddProductToBasket(sku=sku, quantity=quantity)
+        try:
+            res = store_api.dispatch(req)
+            return res.model_dump(exclude_none=True)
+        except ApiException as e:
+            return f"Error: {e.detail}"
 
-system_prompt = """
-You are a business assistant helping customers of OnlineStore.
+    @tool
+    def remove_product(sku: str, quantity: int = 1):
+        """Remove a product from the shopping basket by SKU.
+        Returns the updated basket status."""
+        req = store.Req_RemoveItemFromBasket(sku=sku, quantity=quantity)
+        try:
+            res = store_api.dispatch(req)
+            return res.model_dump(exclude_none=True)
+        except ApiException as e:
+            return f"Error: {e.detail}"
 
-- Clearly report when tasks are done.
-- If ListProducts returns non-zero "NextOffset", it means there are more products available.
-- You can apply coupon codes to get discounts. Use ViewBasket to see current discount and total.
-- Only one coupon can be applied at a time. Apply a new coupon to replace the current one, or remove it explicitly.
-"""
+    @tool
+    def checkout():
+        """Checkout and complete the purchase.
+        This finalizes the transaction. Use this when you have added all necessary items."""
+        req = store.Req_CheckoutBasket()
+        try:
+            res = store_api.dispatch(req)
+            return res.model_dump(exclude_none=True)
+        except ApiException as e:
+            return f"Error: {e.detail}"
 
-CLI_RED = "\x1B[31m"
-CLI_GREEN = "\x1B[32m"
-CLI_CLR = "\x1B[0m"
+    @tool
+    def apply_coupon(coupon: str):
+        """Apply a coupon code to the basket.
+        Use this to get discounts."""
+        req = store.Req_ApplyCoupon(coupon=coupon)
+        try:
+            res = store_api.dispatch(req)
+            return res.model_dump(exclude_none=True)
+        except ApiException as e:
+            return f"Error: {e.detail}"
+
+    @tool
+    def remove_coupon():
+        """Remove the currently applied coupon from the basket."""
+        req = store.Req_RemoveCoupon()
+        try:
+            res = store_api.dispatch(req)
+            return res.model_dump(exclude_none=True)
+        except ApiException as e:
+            return f"Error: {e.detail}"
+
+    @tool
+    def find_best_coupon(coupons: List[str]):
+        """Try multiple coupons on the CURRENT basket content and apply the best one.
+        IMPORTANT: This does NOT simulate adding/removing items. It only tests coupons on what is currently in the basket.
+        Args:
+            coupons: List of coupon codes to test.
+        Returns:
+            Report of tested coupons and the final applied best coupon.
+        """
+        if not coupons:
+            return "No coupons provided."
+        
+        best_coupon = None
+        
+        # First remove any existing coupon to start fresh
+        try:
+            store_api.dispatch(store.Req_RemoveCoupon())
+        except:
+            pass 
+
+        try:
+            initial_basket = store_api.dispatch(store.Req_ViewBasket())
+            base_total = initial_basket.total
+            best_total = base_total
+            report = [f"No coupon: {base_total}"]
+            
+            for code in coupons:
+                try:
+                    store_api.dispatch(store.Req_ApplyCoupon(coupon=code))
+                    basket = store_api.dispatch(store.Req_ViewBasket())
+                    total = basket.total
+                    report.append(f"{code}: {total}")
+                    
+                    if total < best_total:
+                        best_total = total
+                        best_coupon = code
+                except ApiException as e:
+                    report.append(f"{code}: Invalid ({e.detail})")
+                except Exception:
+                    report.append(f"{code}: Error")
+
+            # Apply best coupon
+            if best_coupon:
+                try:
+                    store_api.dispatch(store.Req_ApplyCoupon(coupon=best_coupon))
+                    return f"Tested: {'; '.join(report)}. Applied best: {best_coupon} (Total: {best_total})"
+                except Exception as e:
+                    return f"Error re-applying best coupon {best_coupon}: {e}"
+            else:
+                # Ensure no coupon is applied
+                try:
+                    store_api.dispatch(store.Req_RemoveCoupon())
+                except:
+                    pass
+                return f"Tested: {'; '.join(report)}. No coupon applied (Base price {base_total} was best)."
+        except ApiException as e:
+             return f"Error accessing basket: {e.detail}"
+
+    return [view_basket, add_product, remove_product, checkout, apply_coupon, remove_coupon, find_best_coupon]
 
 def run_agent(model: str, api: ERC3, task: TaskInfo):
-
     store_api = api.get_store_client(task)
+    
+    # Pre-fetch all products
+    print("Fetching all products...")
+    products = fetch_all_products(store_api)
+    products_str = json.dumps(products, indent=2)
+    print(f"Fetched {len(products)} products.")
 
-    # log will contain conversation context for the agent within task
-    log = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task.task_text},
-    ]
+    tools = get_tools(store_api)
+    
+    # Use the passed model, or default to gpt-4o
+    llm_model = model or "gpt-4o"
+    
+    print(f"Init agent with {llm_model} for task: {task.task_text}")
 
-    # let's limit number of reasoning steps by 20, just to be safe
-    for i in range(20):
-        step = f"step_{i + 1}"
-        print(f"Next {step}... ", end="")
+    llm = ChatOpenAI(model=llm_model, temperature=0)
+    # Bind tools with parallel_tool_calls=False to prevent multiple tool calls in one step
+    llm = llm.bind_tools(tools, parallel_tool_calls=False)
 
-        started = time.time()
+    system_prompt = f"""You are an expert shopping agent. Goal: 100% score.
 
-        completion = client.beta.chat.completions.parse(
-            model=model,
-            response_format=NextStep,
-            messages=log,
-            max_completion_tokens=10000,
-        )
+HERE IS THE LIST OF AVAILABLE PRODUCTS:
+{products_str}
 
-        api.log_llm(
-            task_id=task.task_id,
-            model="openai/"+model, # log in OpenRouter format
-            duration_sec=time.time() - started,
-            usage=completion.usage,
-        )
+EXAMPLE (ZERO-SHOT):
+Task: "Buy 24 sodas as cheap as possible. Coupons: SALEX (when buying a lot of 6pk), BULK24 (for 24pk), COMBO (when buying 6pk and 12pk)"
+Reasoning:
+- The agent explored all combinations to reach quantity 24 (e.g. 4x6pk, 1x24pk, 2x12pk, 2x6pk+1x12pk).
+- It found that buying 2x soda-6pk ($12 ea) and 1x soda-12pk ($20 ea) gave a subtotal of $44.
+- Applying coupon SALEX to this specific combo gave a $14 discount, resulting in a total of $30.
+- This was cheaper than other options (like 1x24pk which might be $40 with coupon).
+Correct Result: *Evt_BasketCheckedOut{{Items:[{{soda-6pk 2 12}} {{soda-12pk 1 20}}], Subtotal:44, Coupon:SALEX, Discount:14, Total:30}}
 
-        job = completion.choices[0].message.parsed
+RULES:
+1. **Product Search**: You already have the full list of products above. DO NOT try to search or list products again. Use the list provided.
+2. **Precise Matching**:
+   - Verify EVERY adjective (Color, Model, Specs). "iPhone 15 Pro" != "iPhone 15 Pro Max".
+   - If looking for "Blue", do NOT buy "Black".
+3. **Optimization & Math (CRITICAL)**:
+   - **Divide and Conquer Strategy**: When minimizing cost for a fixed quantity (e.g., "24 sodas"), you MUST test valid combinations SEQUENTIALLY.
+   - **Step 1: List Candidates**: Identify different ways to reach the exact quantity (e.g., 1x24pk, 2x12pk, 4x6pk, 2x6pk+1x12pk).
+   - **Step 2: Sequential Testing**:
+     - **NEVER** add all options to the basket at once. `find_best_coupon` ONLY checks the *current* basket.
+     - Loop through each candidate:
+       1. ENSURE BASKET IS EMPTY (use `remove_product` or start fresh).
+       2. Add the specific items for *this one candidate*.
+       3. Use `find_best_coupon` to see the lowest price for this configuration.
+       4. Record the price.
+       5. Remove items (to prepare for the next candidate).
+   - **Step 3: Select & Execute**: Compare the recorded prices. Re-build the basket with the Single Cheapest Combination and checkout.
+   - **Coupons**: Gather ALL potential coupon codes found in the task or product list and test them on EACH candidate basket.
+4. **Efficiency**:
+   - **Batching**: You can add multiple items for a SINGLE candidate combination in sequence. Do NOT batch items from different solution candidates.
+   - **Verification**: You MUST call `view_basket` immediately after EVERY `apply_coupon` (or `find_best_coupon`) to verify if it worked and check the new price.
+   - **Final Check**: `view_basket` ONCE more before `checkout`.
+   - **Pre-Checkout Reasoning (MANDATORY)**:
+     - You are NOT allowed to checkout blindly.
+     - Before calling `checkout`, output a reasoning block:
+       1. **Recap**: List all valid combinations tested and their final prices.
+       2. **Verification**: Confirm the current basket matches the BEST (cheapest) combination.
+       3. **Decision**: State "Price $X is the lowest. Proceeding to checkout."
+5. **Strict Constraints (CRITICAL)**:
+   - **ALL CONDITIONS MUST BE MET**: If the task requires specific items, specific quantities, specific coupons, or staying under a specific budget, and ANY of these cannot be fully satisfied, you MUST NOT CHECKOUT.
+   - **Coupon Failures**: If the task says "using coupon X" and coupon X is invalid or doesn't apply -> STOP. DO NOT CHECKOUT.
+   - **Impossible Tasks**: If the task is impossible for ANY reason (stock, budget, coupon, item existence) -> STOP. CLEAR THE BASKET. FINISH WITHOUT CHECKOUT.
+   - **Better Safe Than Sorry**: It is better to finish without buying than to buy the wrong thing or ignore a constraint. Finishing without purchase when constraints fail is the CORRECT behavior.
 
-        # if SGR wants to finish, then quit loop
-        if isinstance(job.function, ReportTaskCompletion):
-            print(f"[blue]agent {job.function.code}[/blue]. Summary:")
-            for s in job.function.completed_steps_laconic:
-                print(f"- {s}")
-            break
+6. **Handling Checkout Errors (Dynamic Inventory)**:
+   - If `checkout` fails with "insufficient inventory" (e.g., "available X, in basket Y"):
+     - This is a RACE CONDITION (someone bought it before you).
+     - **ACTION**: Calculate difference (Y - X). Remove that amount from basket using `remove_product`.
+     - **RETRY**: Call `checkout` again immediately.
+   - **NEVER give up** on "insufficient inventory" errors during checkout. Adjust and retry.
 
-        # print next sep for debugging
-        print(job.plan_remaining_steps_brief[0], f"\n  {job.function}")
+7. **Final Execution**:
+   - **DEFAULT**: If ALL constraints are met and you have the best price -> CALL `checkout`.
+   - **PROHIBITION**: IF ANY CONSTRAINT FAILED (missing item, budget exceeded, coupon failed, etc.) -> DO NOT CALL `checkout`. Just stop.
+   - **Do NOT ask for user confirmation**.
+   - **Do NOT say "ready to checkout"**.
+"""
 
-        # Let's add tool request to conversation history as if OpenAI asked for it.
-        # a shorter way would be to just append `job.model_dump_json()` entirely
-        log.append({
-            "role": "assistant",
-            "content": job.plan_remaining_steps_brief[0],
-            "tool_calls": [{
-                "type": "function",
-                "id": step,
-                "function": {
-                    "name": job.function.__class__.__name__,
-                    "arguments": job.function.model_dump_json(),
-                }}]
-        })
-
-        # now execute the tool by dispatching command to our handler
-        try:
-            result = store_api.dispatch(job.function)
-            txt = result.model_dump_json(exclude_none=True, exclude_unset=True)
-            print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
-        except ApiException as e:
-            txt = e.detail
-            # print to console as ascii red
-            print(f"{CLI_RED}ERR: {e.api_error.error}{CLI_CLR}")
-
-        # and now we add results back to the convesation history, so that agent
-        # we'll be able to act on the results in the next reasoning step.
-        log.append({"role": "tool", "content": txt, "tool_call_id": step})
+    graph = create_react_agent(llm, tools, prompt=system_prompt)
+    
+    inputs = {"messages": [HumanMessage(content=task.task_text)]}
+    
+    # Run the agent
+    # We use a recursion limit to prevent infinite loops, but allow enough for pagination
+    try:
+        printed_count = 0
+        for step in graph.stream(inputs, config={"recursion_limit": 50}, stream_mode="values"):
+             messages = step["messages"]
+             for message in messages[printed_count:]:
+                 if message.type == "tool":
+                     print(f"\n[Function Result] {message.name}: {message.content}")
+                 elif message.content:
+                     print(f"\n[{message.type}]: {message.content}")
+                 if hasattr(message, "tool_calls") and message.tool_calls:
+                     for tc in message.tool_calls:
+                         print(f"\n[Tool Call]: {tc['name']} params={tc['args']}")
+             printed_count = len(messages)
+    
+    except Exception as e:
+        print(f"Agent failed with error: {e}")
