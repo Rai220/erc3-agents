@@ -1,5 +1,6 @@
 import time
 import json
+import re
 from typing import Annotated, List, Union, Literal, Optional
 from pydantic import BaseModel, Field
 from erc3 import store, ApiException, TaskInfo, ERC3
@@ -12,6 +13,8 @@ def fetch_all_products(store_api):
     all_products = []
     offset = 0
     limit = 3 # Limit set to 3 to comply with potential server restrictions
+    retried_with_lower_limit = False  # Flag to prevent infinite retry loop
+    
     while True:
         req = store.Req_ListProducts(offset=offset, limit=limit)
         try:
@@ -23,8 +26,27 @@ def fetch_all_products(store_api):
                 break
             offset = res.next_offset
         except ApiException as e:
-            print(f"Warning: Error fetching products batch: {e}")
-            break
+            error_str = str(e)
+            
+            # Check if it's a page limit error like "page limit exceeded: 3 > 2"
+            match = re.search(r'page limit exceeded:\s*(\d+)\s*>\s*(\d+)', error_str)
+            if match and not retried_with_lower_limit:
+                available_pages = int(match.group(2))
+                print(f"Detected page limit: {available_pages} pages available. Adjusting limit...")
+                
+                # Reduce limit to match available pages and restart
+                if available_pages > 0:
+                    limit = available_pages
+                    offset = 0
+                    all_products = []  # Clear in case of partial data
+                    retried_with_lower_limit = True
+                    continue
+                else:
+                    break
+            else:
+                # Unknown error or already retried, stop fetching
+                print(f"Warning: Error fetching products batch: {error_str}")
+                break
     return all_products
 
 def get_tools(store_api):
@@ -98,6 +120,31 @@ def get_tools(store_api):
             return f"Error: {e.detail}"
 
     @tool
+    def think(thoughts: str):
+        """Use this tool to think and reason before making a decision.
+        MANDATORY: You MUST call this tool BEFORE calling checkout.
+        
+        In your thoughts, you should:
+        1. Recap the original task requirements (items, quantities, coupons, budget constraints)
+        2. List what has been accomplished (items in basket, applied coupon, total price)
+        3. Verify that ALL requirements are met:
+           - Required items are in the basket with correct quantities
+           - Required coupon is applied (if specified in task)
+           - Discount is correctly applied (if required)
+           - Budget constraint is satisfied (if specified)
+        4. Make a decision: proceed to checkout OR stop without checkout
+        
+        If ANY requirement is not met, conclude that checkout should NOT happen.
+        
+        Args:
+            thoughts: Your reasoning about whether all task requirements are satisfied.
+        
+        Returns:
+            Your thoughts (for logging/debugging purposes).
+        """
+        return f"Thought process recorded: {thoughts}"
+
+    @tool
     def find_best_coupon(coupons: List[str]):
         """Try multiple coupons on the CURRENT basket content and apply the best one.
         IMPORTANT: This does NOT simulate adding/removing items. It only tests coupons on what is currently in the basket.
@@ -155,7 +202,7 @@ def get_tools(store_api):
         except ApiException as e:
              return f"Error accessing basket: {e.detail}"
 
-    return [view_basket, add_product, remove_product, checkout, apply_coupon, remove_coupon, find_best_coupon]
+    return [view_basket, add_product, remove_product, checkout, apply_coupon, remove_coupon, think, find_best_coupon]
 
 def run_agent(model: str, api: ERC3, task: TaskInfo):
     store_api = api.get_store_client(task)
@@ -213,12 +260,15 @@ RULES:
    - **Batching**: You can add multiple items for a SINGLE candidate combination in sequence. Do NOT batch items from different solution candidates.
    - **Verification**: You MUST call `view_basket` immediately after EVERY `apply_coupon` (or `find_best_coupon`) to verify if it worked and check the new price.
    - **Final Check**: `view_basket` ONCE more before `checkout`.
-   - **Pre-Checkout Reasoning (MANDATORY)**:
+   - **Pre-Checkout Reasoning with think() (MANDATORY)**:
      - You are NOT allowed to checkout blindly.
-     - Before calling `checkout`, output a reasoning block:
-       1. **Recap**: List all valid combinations tested and their final prices.
-       2. **Verification**: Confirm the current basket matches the BEST (cheapest) combination.
-       3. **Decision**: State "Price $X is the lowest. Proceeding to checkout."
+     - **BEFORE calling `checkout`, you MUST call `think()` tool** to reason about the task.
+     - In `think()`, include:
+       1. **Recap**: List original task requirements (items, quantities, coupons, discounts, budget).
+       2. **Accomplished**: What is currently in the basket? What coupon is applied? What is the discount?
+       3. **Verification**: Does the basket match ALL requirements? Is the required coupon applied? Is the discount correct?
+       4. **Decision**: If ALL requirements are met -> "Proceeding to checkout." If ANY requirement is NOT met -> "STOPPING without checkout."
+     - If your `think()` concludes that requirements are NOT met, DO NOT call `checkout`. Just stop.
 5. **Strict Constraints (CRITICAL)**:
    - **ALL CONDITIONS MUST BE MET**: If the task requires specific items, specific quantities, specific coupons, or staying under a specific budget, and ANY of these cannot be fully satisfied, you MUST NOT CHECKOUT.
    - **Coupon Failures**: If the task says "using coupon X" and coupon X is invalid or doesn't apply -> STOP. DO NOT CHECKOUT.
@@ -245,19 +295,45 @@ RULES:
     
     # Run the agent
     # We use a recursion limit to prevent infinite loops, but allow enough for pagination
+    
+    # Token usage tracking
+    total_input_tokens = 0
+    total_output_tokens = 0
+    
+    start_time = time.time()
+    
     try:
         printed_count = 0
         for step in graph.stream(inputs, config={"recursion_limit": 50}, stream_mode="values"):
-             messages = step["messages"]
-             for message in messages[printed_count:]:
-                 if message.type == "tool":
-                     print(f"\n[Function Result] {message.name}: {message.content}")
-                 elif message.content:
-                     print(f"\n[{message.type}]: {message.content}")
-                 if hasattr(message, "tool_calls") and message.tool_calls:
-                     for tc in message.tool_calls:
-                         print(f"\n[Tool Call]: {tc['name']} params={tc['args']}")
-             printed_count = len(messages)
+            messages = step["messages"]
+            for message in messages[printed_count:]:
+                # Track token usage from AI messages
+                if hasattr(message, "usage_metadata") and message.usage_metadata:
+                    usage = message.usage_metadata
+                    total_input_tokens += usage.get("input_tokens", 0)
+                    total_output_tokens += usage.get("output_tokens", 0)
+                
+                if message.type == "tool":
+                    print(f"\n[Function Result] {message.name}: {message.content}")
+                elif message.content:
+                    print(f"\n[{message.type}]: {message.content}")
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    for tc in message.tool_calls:
+                        print(f"\n[Tool Call]: {tc['name']} params={tc['args']}")
+            printed_count = len(messages)
     
     except Exception as e:
         print(f"Agent failed with error: {e}")
+    
+    duration_sec = time.time() - start_time
+    
+    # Return statistics
+    return {
+        "model": llm_model,
+        "duration_sec": duration_sec,
+        "usage": {
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "total_tokens": total_input_tokens + total_output_tokens
+        }
+    }
